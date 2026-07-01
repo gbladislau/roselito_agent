@@ -29,6 +29,15 @@
   <arg name="path" default="$(env PWD)/route.pon"/>
   <arg name="squared_threshold_distance" default="1.0"/>
   <arg name="frequency" default="20.0"/>
+  <arg name="person_position_topic" default="/person_position"/>
+  <arg name="person_nearby_distance" default="3.0"/>
+  <arg name="person_detection_timeout" default="1.0"/>
+  <!-- person_distance node parameters -->
+  <arg name="camera_frame" default="camera_color_optical_frame"/>
+  <arg name="detection_frequency" default="10.0"/>
+  <arg name="confidence_threshold" default="0.3"/>
+  <arg name="frame_width" default="640"/>
+  <arg name="frame_height" default="480"/>
   <node name="replay_route" pkg="roselito_agent" exec="replay_route">
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="global_frame" value="$(var global_frame)"/>
@@ -36,5 +45,16 @@
     <param name="save_path" value="$(var path)"/>
     <param name="squared_threshold_distance" value="$(var squared_threshold_distance)"/>
     <param name="frequency" value="$(var frequency)"/>
+    <param name="person_position_topic" value="$(var person_position_topic)"/>
+    <param name="person_nearby_distance" value="$(var person_nearby_distance)"/>
+    <param name="person_detection_timeout" value="$(var person_detection_timeout)"/>
+  </node>
+  <node name="person_distance" pkg="roselito_agent" exec="person_distance">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
+    <param name="frequency" value="$(var detection_frequency)"/>
+    <param name="confidence_threshold" value="$(var confidence_threshold)"/>
+    <param name="frame_width" value="$(var frame_width)"/>
+    <param name="frame_height" value="$(var frame_height)"/>
+    <param name="camera_frame" value="$(var camera_frame)"/>
   </node>
 </launch>

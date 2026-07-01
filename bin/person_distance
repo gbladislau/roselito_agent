@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+
+r'''Detect a person using an Intel RealSense camera and publish their distance.
+
+Reads aligned color + depth frames from a RealSense device, runs OpenCV's HOG
+pedestrian detector on the color image, samples the aligned depth frame at the
+center of the best detection, and publishes the result as a
+geometry_msgs/PointStamped message on /person_position.
+
+The published point is expressed in the camera frame:
+  x = forward distance to the person (meters, from depth)
+  y = lateral offset (meters, positive = right)
+  z = vertical offset (meters, positive = up)
+
+If no person is detected in a frame, nothing is published.  The replay_route
+node treats the absence of a recent message as "person not nearby" and pauses
+waypoint advancement.
+'''
+
+import rclpy
+from rclpy.node import Node
+
+import geometry_msgs.msg
+
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+
+
+class PersonDistance(Node):
+    r'''Detect a person and publish their distance from the camera.'''
+
+    def __init__(self):
+        super().__init__('person_distance')
+
+        # --- Parameters ---
+        self.declare_parameter('frequency', 10.0)
+        self.declare_parameter('confidence_threshold', 0.3)
+        # Frame dimensions to request from the RealSense device.
+        self.declare_parameter('frame_width', 640)
+        self.declare_parameter('frame_height', 480)
+        # How many pixels around the bounding-box centre to average for depth.
+        self.declare_parameter('depth_sample_radius', 5)
+        # Optical frame id to stamp published messages with.
+        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+
+        self.__confidence_threshold = self.get_parameter('confidence_threshold').value
+        self.__depth_sample_radius  = self.get_parameter('depth_sample_radius').value
+        self.__camera_frame         = self.get_parameter('camera_frame').value
+        width  = self.get_parameter('frame_width').value
+        height = self.get_parameter('frame_height').value
+
+        self.get_logger().info(f'Confidence threshold : {self.__confidence_threshold}')
+        self.get_logger().info(f'Camera frame         : {self.__camera_frame}')
+        self.get_logger().info(f'Resolution           : {width}x{height}')
+
+        # --- OpenCV HOG person detector ---
+        self.__hog = cv2.HOGDescriptor()
+        self.__hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+        # --- RealSense pipeline ---
+        self.__pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, width, height, rs.format.z16,  30)
+        profile = self.__pipeline.start(config)
+
+        # Read the depth scale so we can convert raw values to metres.
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self.__depth_scale = depth_sensor.get_depth_scale()
+        self.get_logger().info(f'Depth scale          : {self.__depth_scale} m/unit')
+
+        # Align depth to colour frame so pixels correspond 1-to-1.
+        self.__align = rs.align(rs.stream.color)
+
+        # Intrinsics (needed to convert pixel offset → metres).
+        color_profile = profile.get_stream(rs.stream.color)
+        self.__intrinsics = color_profile.as_video_stream_profile().get_intrinsics()
+
+        # --- Publisher ---
+        self.__pub = self.create_publisher(
+            geometry_msgs.msg.PointStamped,
+            '/person_position',
+            1,
+        )
+
+        # --- Timer ---
+        period = 1.0 / self.get_parameter('frequency').value
+        self.__timer = self.create_timer(period, self.__callback)
+
+        self.get_logger().info('person_distance node ready.')
+
+    def __del__(self):
+        try:
+            self.__pipeline.stop()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def __sample_depth(
+        self,
+        depth_image: np.ndarray,
+        cx: int,
+        cy: int,
+    ) -> float:
+        r'''Return median depth (metres) in a small patch around (cx, cy).
+
+        Returns 0.0 if the patch contains no valid (non-zero) readings.
+        '''
+        r = self.__depth_sample_radius
+        h, w = depth_image.shape
+        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+        patch = depth_image[y0:y1, x0:x1]
+        valid = patch[patch > 0]
+        if valid.size == 0:
+            return 0.0
+        return float(np.median(valid)) * self.__depth_scale
+
+    def __pixel_to_point(self, cx: int, cy: int, depth_m: float):
+        r'''Back-project a colour pixel + depth to 3-D camera coordinates.
+
+        Returns (x_forward, y_right, z_up) in metres using the colour stream
+        intrinsics.  The RealSense convention is:
+          x = right, y = down, z = forward
+        We re-map so that x = forward (distance), y = lateral, z = vertical.
+        '''
+        # rs2_deproject_pixel_to_point returns [X, Y, Z] in camera coords:
+        #   X = right, Y = down, Z = forward
+        point_rs = rs.rs2_deproject_pixel_to_point(
+            self.__intrinsics, [cx, cy], depth_m
+        )
+        x_forward = point_rs[2]   # Z_rs  → forward distance
+        y_lateral = point_rs[0]   # X_rs  → lateral offset (right positive)
+        z_vertical = -point_rs[1] # -Y_rs → vertical offset (up positive)
+        return x_forward, y_lateral, z_vertical
+
+    # ------------------------------------------------------------------
+    # Timer callback
+    # ------------------------------------------------------------------
+
+    def __callback(self):
+        r'''Grab one frame-set, detect a person, publish distance.'''
+        # Try to get the latest aligned frame-set without blocking indefinitely.
+        try:
+            frames = self.__pipeline.poll_for_frames()
+        except Exception as e:
+            self.get_logger().warn(f'RealSense poll error: {e}')
+            return
+
+        if not frames or frames.size() == 0:
+            return  # No new frame yet; try next tick.
+
+        aligned = self.__align.process(frames)
+        color_frame = aligned.get_color_frame()
+        depth_frame = aligned.get_depth_frame()
+
+        if not color_frame or not depth_frame:
+            return
+
+        color_image = np.asanyarray(color_frame.get_data())
+        depth_image = np.asanyarray(depth_frame.get_data())  # uint16, raw units
+
+        # Run HOG detector.
+        # winStride controls the step between windows; scale controls image pyramid.
+        rects, weights = self.__hog.detectMultiScale(
+            color_image,
+            winStride=(8, 8),
+            padding=(4, 4),
+            scale=1.05,
+        )
+
+        if len(rects) == 0:
+            # No detection — publish nothing; replay_route timeout will handle it.
+            return
+
+        # Filter by confidence threshold and pick the most confident detection.
+        best_rect   = None
+        best_weight = -1.0
+        for rect, weight in zip(rects, weights):
+            w = float(weight[0]) if hasattr(weight, '__len__') else float(weight)
+            if w >= self.__confidence_threshold and w > best_weight:
+                best_weight = w
+                best_rect   = rect
+
+        if best_rect is None:
+            return
+
+        x, y, bw, bh = best_rect
+        cx = int(x + bw // 2)
+        cy = int(y + bh // 2)
+
+        depth_m = self.__sample_depth(depth_image, cx, cy)
+        if depth_m <= 0.0:
+            self.get_logger().debug('Valid detection but depth is zero; skipping.')
+            return
+
+        x_fwd, y_lat, z_vert = self.__pixel_to_point(cx, cy, depth_m)
+
+        msg = geometry_msgs.msg.PointStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.__camera_frame
+        msg.point.x = x_fwd
+        msg.point.y = y_lat
+        msg.point.z = z_vert
+
+        self.__pub.publish(msg)
+        self.get_logger().info(
+            f'Person detected: depth={depth_m:.2f} m  '
+            f'fwd={x_fwd:.2f}  lat={y_lat:.2f}  vert={z_vert:.2f}  '
+            f'confidence={best_weight:.2f}'
+        )
+
+
+def main():
+    r'''Start the node.'''
+    rclpy.init()
+    node = PersonDistance()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -46,6 +46,13 @@ To set the squared path distance threshold, call:
 ros2 launch roselito_agent replay_route.launch squared_threshold_distance:={float}
 ```
 
+To configure the camera-based person proximity check, publish the detected person
+position as a `geometry_msgs/msg/PointStamped` relative to the robot camera or
+base frame and set the replay parameters:
+```bash
+ros2 launch roselito_agent replay_route.launch person_position_topic:=/person_position person_nearby_distance:=3.0 person_detection_timeout:=1.0
+```
+
 The `path` argument can be omitted, in which case the route is loaded from a file named `route.pon` in the current folder.
 
 When replaying routes in simulation, make sure to add the `use_sim_time` argument:

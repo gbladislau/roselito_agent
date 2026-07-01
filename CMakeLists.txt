@@ -34,6 +34,7 @@ install(
   PROGRAMS
     "bin/teach_route"
     "bin/replay_route"
+    "bin/person_distance"
   DESTINATION
     "lib/${PROJECT_NAME}"
 )

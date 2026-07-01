@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright (C) 2025 Helio Perroni Filho (xperroni@gmail.com)
 #
@@ -21,6 +21,8 @@ r'''Record route waypoints for later replay.
 
 
 import rclpy
+from pathlib import Path
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 
 from geometry_msgs import msg as geometry_msg
@@ -47,9 +49,13 @@ class TeachRoute(ParameterNode):
         super().__init__('teach_route')
 
         self.declare_parameter('auto_save', False)
-        self.declare_parameter('auto_save_frequency', 1.0)
+        self.declare_parameter(
+            'auto_save_frequency',
+            1.0,
+            ParameterDescriptor(dynamic_typing=True)
+        )
         self.__auto_save = self.get_parameter("auto_save").value
-        self.__auto_save_frequency = self.get_parameter('auto_save_frequency').value
+        self.__auto_save_frequency = float(self.get_parameter('auto_save_frequency').value)
 
         self.__buffer = Buffer()
         self.__listener = TransformListener(self.__buffer, self)
@@ -113,6 +119,7 @@ class TeachRoute(ParameterNode):
         path = request.path
         if not path:
             path = self._save_path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as out:
             out.write(f'{repr(self.__route)}\n')
 
@@ -136,6 +143,7 @@ class TeachRoute(ParameterNode):
         r'''Handle the auto saving poses file.
         '''
         try:
+            Path(self._save_path).parent.mkdir(parents=True, exist_ok=True)
             with open(self._save_path, 'w') as out:
                 out.write(f'{repr(self.__route)}\n')
         except Exception as e:

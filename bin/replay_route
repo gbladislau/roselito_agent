@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 r'''Replay route waypoints from a file.
 '''
@@ -19,6 +19,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from copy import deepcopy
+from math import sqrt
 from sys import exit
 
 from roselito_agent import (
@@ -37,9 +38,18 @@ class ReplayRoute(ParameterNode):
         super().__init__('replay_route')
         self.declare_parameter('frequency', 20.0)
         self.declare_parameter('squared_threshold_distance',1.0)
+        self.declare_parameter('person_position_topic', '/person_position')
+        self.declare_parameter('person_nearby_distance', 3.0)
+        self.declare_parameter('person_detection_timeout', 1.0)
 
         self.__squared_threshold_distance = self.get_parameter('squared_threshold_distance').value
+        self.__person_position_topic = self.get_parameter('person_position_topic').value
+        self.__person_nearby_distance = self.get_parameter('person_nearby_distance').value
+        self.__person_detection_timeout = self.get_parameter('person_detection_timeout').value
+        self.__last_person_position = None
         self.get_logger().info(f'Squared Distance Threshold : {self.__squared_threshold_distance}')
+        self.get_logger().info(f'Person Position Topic : {self.__person_position_topic}')
+        self.get_logger().info(f'Person Nearby Distance : {self.__person_nearby_distance}')
         self.get_logger().info(f"Current Path : {self.get_parameter('save_path').value}")
         self.get_logger().info(f"Set Frequency : {self.get_parameter('frequency').value}")
     
@@ -58,9 +68,19 @@ class ReplayRoute(ParameterNode):
         self.__current_pose = geometry_msgs.msg.PoseStamped()
 
         self.__pub_goal = self.create_publisher(geometry_msgs.msg.PoseStamped, '/goal_pose', 1)
+        self.__person_position_sub = self.create_subscription(
+            geometry_msgs.msg.PointStamped,
+            self.__person_position_topic,
+            self.__person_position_callback,
+            1,
+        )
 
         period = 1.0 / self.get_parameter('frequency').value
         self.__timer = self.create_timer(period, self.__callback)
+
+    def __person_position_callback(self, position: geometry_msgs.msg.PointStamped):
+        r'''Store the latest person position detected by the robot camera.'''
+        self.__last_person_position = position
 
     def __callback(self):
         r'''Timer callback.
@@ -92,10 +112,24 @@ class ReplayRoute(ParameterNode):
             # 1. Select the next pose in the route
             current_goal_pose = deepcopy(self.__route.poses[self.__current_goal_pose])
 
-            # 2. Publish it as a goal to the navigation stack
+            # 2. Publish it as a goal to the navigation stack.
+            # We always publish (even when paused) so Nav2 doesn't time out.
             current_goal_pose.header.stamp = self.get_clock().now().to_msg()
-            self.get_logger().info(f'Publishing pose: {current_goal_pose}')
             self.__pub_goal.publish(current_goal_pose)
+
+            # Person proximity guard: pause waypoint advancement when the person
+            # is too far away or has not been detected recently.
+            if not self.is_person_following_nearby():
+                self.get_logger().info(
+                    f'Person not nearby — holding at waypoint {self.__current_goal_pose}, '
+                    f'not advancing.'
+                )
+                return
+
+            self.get_logger().info(
+                f'Person nearby — advancing waypoint {self.__current_goal_pose}: '
+                f'{current_goal_pose}'
+            )
 
             # 3. Use the TF buffer to check whether the robot is nearing the current goal
             try:
@@ -123,6 +157,22 @@ class ReplayRoute(ParameterNode):
         dz = c_pose.pose.position.z - g_pose.pose.position.z
         self.get_logger().info(f"Goal Distance : {(dx*dx + dy*dy + dz*dz)}")
         return (dx*dx + dy*dy + dz*dz)
+
+    def is_person_following_nearby(self) -> bool:
+        r'''Return whether the camera sees the following person close to the robot.'''
+        if self.__last_person_position is None:
+            return False
+
+        now = self.get_clock().now()
+        detection_time = rclpy.time.Time.from_msg(self.__last_person_position.header.stamp)
+        detection_age = (now - detection_time).nanoseconds / 1000000000.0
+        if detection_age > self.__person_detection_timeout:
+            return False
+
+        point = self.__last_person_position.point
+        distance = sqrt(point.x * point.x + point.y * point.y + point.z * point.z)
+        self.get_logger().info(f'Person Distance : {distance}')
+        return distance <= self.__person_nearby_distance
 
             
 
