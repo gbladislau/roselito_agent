@@ -35,9 +35,13 @@
   <!-- person_distance node parameters -->
   <arg name="camera_frame" default="camera_color_optical_frame"/>
   <arg name="detection_frequency" default="10.0"/>
-  <arg name="confidence_threshold" default="0.3"/>
+  <arg name="confidence_threshold" default="0.4"/>
+  <arg name="image_scale" default="1.5"/>
   <arg name="frame_width" default="640"/>
   <arg name="frame_height" default="480"/>
+  <!-- DNN model files (MobileNet-SSD). Leave empty to fall back to HOG. -->
+  <arg name="model_config" default="$(env PWD)/models/MobileNetSSD_deploy.prototxt"/>
+  <arg name="model_weights" default="$(env PWD)/models/MobileNetSSD_deploy.caffemodel"/>
   <node name="replay_route" pkg="roselito_agent" exec="replay_route">
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="global_frame" value="$(var global_frame)"/>
@@ -53,8 +57,11 @@
     <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param name="frequency" value="$(var detection_frequency)"/>
     <param name="confidence_threshold" value="$(var confidence_threshold)"/>
+    <param name="image_scale" value="$(var image_scale)"/>
     <param name="frame_width" value="$(var frame_width)"/>
     <param name="frame_height" value="$(var frame_height)"/>
     <param name="camera_frame" value="$(var camera_frame)"/>
+    <param name="model_config" value="$(var model_config)"/>
+    <param name="model_weights" value="$(var model_weights)"/>
   </node>
 </launch>
