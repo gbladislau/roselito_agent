@@ -39,13 +39,18 @@ class ReplayRoute(ParameterNode):
         self.declare_parameter('frequency', 20.0)
         self.declare_parameter('squared_threshold_distance',1.0)
         self.declare_parameter('person_position_topic', '/person_position')
-        self.declare_parameter('person_nearby_distance', 3.0)
+        self.declare_parameter('person_nearby_distance', 1.5)
         self.declare_parameter('person_detection_timeout', 1.0)
+        # Number of consecutive ticks without a nearby person before the robot
+        # pauses.  At 20 Hz the default of 40 gives a 2-second grace window.
+        self.declare_parameter('person_miss_limit', 40)
 
         self.__squared_threshold_distance = self.get_parameter('squared_threshold_distance').value
         self.__person_position_topic = self.get_parameter('person_position_topic').value
         self.__person_nearby_distance = self.get_parameter('person_nearby_distance').value
         self.__person_detection_timeout = self.get_parameter('person_detection_timeout').value
+        self.__person_miss_limit = self.get_parameter('person_miss_limit').value
+        self.__person_miss_count = 0
         self.__last_person_position = None
         self.get_logger().info(f'Squared Distance Threshold : {self.__squared_threshold_distance}')
         self.get_logger().info(f'Person Position Topic : {self.__person_position_topic}')
@@ -117,14 +122,24 @@ class ReplayRoute(ParameterNode):
             current_goal_pose.header.stamp = self.get_clock().now().to_msg()
             self.__pub_goal.publish(current_goal_pose)
 
-            # Person proximity guard: pause waypoint advancement when the person
-            # is too far away or has not been detected recently.
-            if not self.is_person_following_nearby():
+            # Person proximity guard: only pause after person_miss_limit
+            # consecutive ticks without a nearby detection.  This prevents the
+            # robot from stopping on momentary detection glitches.
+            if self.is_person_following_nearby():
+                self.__person_miss_count = 0  # reset buffer on any good detection
+            else:
+                self.__person_miss_count += 1
                 self.get_logger().info(
-                    f'Person not nearby — holding at waypoint {self.__current_goal_pose}, '
-                    f'not advancing.'
+                    f'Person not nearby — miss count {self.__person_miss_count}'
+                    f'/{self.__person_miss_limit}.'
                 )
-                return
+                if self.__person_miss_count >= self.__person_miss_limit:
+                    self.get_logger().info(
+                        f'Miss limit reached — holding at waypoint '
+                        f'{self.__current_goal_pose}.'
+                    )
+                    return
+                # Still within the grace window — keep advancing normally.
 
             self.get_logger().info(
                 f'Person nearby — advancing waypoint {self.__current_goal_pose}: '

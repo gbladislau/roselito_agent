@@ -32,6 +32,8 @@
   <arg name="person_position_topic" default="/person_position"/>
   <arg name="person_nearby_distance" default="3.0"/>
   <arg name="person_detection_timeout" default="1.0"/>
+  <!-- Consecutive ticks without a nearby person before pausing (default 20 = 1 s at 20 Hz) -->
+  <arg name="person_miss_limit" default="20"/>
   <!-- person_distance node parameters -->
   <arg name="camera_frame" default="camera_color_optical_frame"/>
   <arg name="detection_frequency" default="10.0"/>
@@ -52,6 +54,7 @@
     <param name="person_position_topic" value="$(var person_position_topic)"/>
     <param name="person_nearby_distance" value="$(var person_nearby_distance)"/>
     <param name="person_detection_timeout" value="$(var person_detection_timeout)"/>
+    <param name="person_miss_limit" value="$(var person_miss_limit)"/>
   </node>
   <node name="person_distance" pkg="roselito_agent" exec="person_distance">
     <param name="use_sim_time" value="$(var use_sim_time)"/>
