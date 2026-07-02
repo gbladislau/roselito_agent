@@ -262,7 +262,7 @@ def run_route(route_path):
         "source ./install/setup.bash && "
         "source ../roselito_interfaces/install/setup.bash && "
         "source /opt/ros/humble/setup.bash && "
-        "ros2 launch roselito_agent replay_route.launch path:={route_path}"
+        f"ros2 launch roselito_agent replay_route.launch path:={route_path}"
     )
     process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
     st.session_state.running_route_pid = process.pid
