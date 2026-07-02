@@ -160,7 +160,7 @@ def init_ros():
     return node
 
 ros_node = init_ros()
-
+network_ip = os.getenv("JETSON_NET_IP", "192.168.68.76")  # Default to localhost if ROS_IP is not set
 
 # ==========================================
 # 3. MAIN USER INTERFACE
@@ -282,14 +282,14 @@ if show_feeds:
     with col1:
         st.caption("RGB Feed")
         if frame_buffer.camera_available:
-            st.markdown('<img src="http://localhost:8089/rgb" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
+            st.markdown(f'<img src="http://{network_ip}:8089/rgb" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
         else:
             st.warning("Camera hardware stream is offline.")
             
     with col2:
         st.caption("Depth Map")
         if frame_buffer.camera_available:
-            st.markdown('<img src="http://localhost:8089/depth" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
+            st.markdown(f'<img src="http://{network_ip}:8089/depth" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
         else:
             st.info(f"Reason: {frame_buffer.camera_error or 'Initializing hardware...'}")
             
