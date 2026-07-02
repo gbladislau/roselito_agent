@@ -199,7 +199,7 @@ with col_start:
                 "cd ~/Projects/roselito_robot && "
                 "source ./scripts/setup.bash && "
                 "source /opt/ros/humble/setup.bash && "
-                "ros2 launch roselito_ugv_jetson start.launch map:=/home/jetson/Projects/roselito_robot/braga/mapa_lcad"
+                "ros2 launch roselito_ugv_jetson start.launch map:=/home/jetson/Projects/roselito_robot/braga/mapa_lcad > /tmp/roselito_robot_start.log 2>&1"
             )
             process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
             st.session_state.robot_pid = process.pid
@@ -237,21 +237,21 @@ st.write("---")
 # ==========================================
 st.subheader("Map Routes Grid")
 
-def run_route(route_path):
-    st.info(f"Launching route: {os.path.basename(route_path)}...")
+def run_route(route_path: Path):
+    st.info(f"Launching route: {route_path.name}...")
     combined_cmd = (
         "cd ~/Projects/roselito_agent && "
         "source ./install/setup.bash && "
         "source ../roselito_interfaces/install/setup.bash && "
         "source /opt/ros/humble/setup.bash && "
-        "ros2 launch roselito_agent replay_route.launch path:={route_path}"
+        f"ros2 launch roselito_agent replay_route.launch path:={route_path}  > /tmp/roselito_agent_replay_route.log 2>&1"
     )
     process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
     st.session_state.running_route_pid = process.pid
     st.rerun()
 
 routes_dir = Path(os.getcwd()).parent 
-route_files = glob.glob(os.path.join(routes_dir, "*.pon"))
+route_files = [Path(f) for f in glob.glob(os.path.join(routes_dir, "*.pon"))]
 
 if not route_files:
     st.info(f"No `.pon` route files found in `{routes_dir}`.")
@@ -265,7 +265,7 @@ else:
         display_name = filename.replace(".pon", "").replace("_", " ").title()
         with cols[idx % grid_columns]:
             if st.button(f"📍 {display_name}", key=filename, use_container_width=True, disabled=is_route_busy):
-                run_route(route_path)
+                run_route(Path(routes_dir / route_path))
 
 st.write("---")
 
