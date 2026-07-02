@@ -20,7 +20,7 @@ from std_msgs.msg import Float32
 st.set_page_config(layout="wide")
 
 # ==========================================
-# GLOBAL THREAD SAFE BUFFER FOR CAMERAS
+# CLASS DEFINITION FOR BUFFER
 # ==========================================
 class CameraFrameBuffer:
     def __init__(self):
@@ -30,73 +30,15 @@ class CameraFrameBuffer:
         self.camera_available = False
         self.camera_error = ""
 
-frame_buffer = CameraFrameBuffer()
-
 # ==========================================
-# 1. BACKGROUND MJPEG STREAMING SERVER
-# ==========================================
-class VideoStreamHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/rgb':
-            self.send_response(200)
-            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            while True:
-                with frame_buffer.lock:
-                    if frame_buffer.bgr_frame is None:
-                        time.sleep(0.01)
-                        continue
-                    _, encoded_img = cv2.imencode('.jpg', frame_buffer.bgr_frame)
-                
-                try:
-                    self.wfile.write(b'--frame\r\n')
-                    self.send_header('Content-type', 'image/jpeg')
-                    self.send_header('Content-length', str(len(encoded_img)))
-                    self.end_headers()
-                    self.wfile.write(encoded_img.tobytes())
-                    self.wfile.write(b'\r\n')
-                except (ConnectionResetError, BrokenPipeError):
-                    break
-                time.sleep(0.03)  # Cap around ~30 FPS
-
-        elif self.path == '/depth':
-            self.send_response(200)
-            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            while True:
-                with frame_buffer.lock:
-                    if frame_buffer.depth_frame is None:
-                        time.sleep(0.01)
-                        continue
-                    _, encoded_img = cv2.imencode('.jpg', frame_buffer.depth_frame)
-                
-                try:
-                    self.wfile.write(b'--frame\r\n')
-                    self.send_header('Content-type', 'image/jpeg')
-                    self.send_header('Content-length', str(len(encoded_img)))
-                    self.end_headers()
-                    self.wfile.write(encoded_img.tobytes())
-                    self.wfile.write(b'\r\n')
-                except (ConnectionResetError, BrokenPipeError):
-                    break
-                time.sleep(0.03)
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle camera stream network requests in independent threads."""
-    pass
-
-@st.cache_resource
-def start_mjpeg_server():
-    server = ThreadedHTTPServer(('0.0.0.0', 8089), VideoStreamHandler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    return server
-
-# ==========================================
-# 2. HARDWARE CAPTURE THREAD (REALSENSE)
+# 1. UNIFIED & CACHED HARDWARE SYSTEM
 # ==========================================
 @st.cache_resource
-def start_camera_thread():
+def initialize_camera_system():
+    # Create a single, persistent buffer instance that survives script reruns
+    buffer = CameraFrameBuffer()
+    
+    # Define the isolated camera hardware thread inside the enclosure
     def camera_loop():
         try:
             pipeline = rs.pipeline()
@@ -107,8 +49,8 @@ def start_camera_thread():
             align = rs.align(rs.stream.color)
             colorizer = rs.colorizer()
             
-            with frame_buffer.lock:
-                frame_buffer.camera_available = True
+            with buffer.lock:
+                buffer.camera_available = True
             
             while True:
                 frames = pipeline.wait_for_frames(timeout_ms=1000)
@@ -123,28 +65,78 @@ def start_camera_thread():
                 local_colorized_depth = np.asanyarray(colorizer.colorize(depth_f).get_data())
                 local_depth_bgr = cv2.cvtColor(local_colorized_depth, cv2.COLOR_RGB2BGR)
 
-                with frame_buffer.lock:
-                    frame_buffer.bgr_frame = local_bgr
-                    frame_buffer.depth_frame = local_depth_bgr
+                with buffer.lock:
+                    buffer.bgr_frame = local_bgr
+                    buffer.depth_frame = local_depth_bgr
                     
         except Exception as e:
-            with frame_buffer.lock:
-                frame_buffer.camera_available = False
-                frame_buffer.camera_error = str(e)
+            with buffer.lock:
+                buffer.camera_available = False
+                buffer.camera_error = str(e)
 
     cam_thread = threading.Thread(target=camera_loop, daemon=True)
     cam_thread.start()
-    return True
 
-# Initialize Background Pipelines
-start_mjpeg_server()
-start_camera_thread()
+    # Define the local streaming server rules locked onto this specific buffer instance
+    class VideoStreamHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/rgb':
+                self.send_response(200)
+                self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                while True:
+                    with buffer.lock:
+                        if buffer.bgr_frame is None:
+                            time.sleep(0.01)
+                            continue
+                        _, encoded_img = cv2.imencode('.jpg', buffer.bgr_frame)
+                    try:
+                        self.wfile.write(b'--frame\r\n')
+                        self.send_header('Content-type', 'image/jpeg')
+                        self.send_header('Content-length', str(len(encoded_img)))
+                        self.end_headers()
+                        self.wfile.write(encoded_img.tobytes())
+                        self.wfile.write(b'\r\n')
+                    except (ConnectionResetError, BrokenPipeError):
+                        break
+                    time.sleep(0.03)
+
+            elif self.path == '/depth':
+                self.send_response(200)
+                self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                while True:
+                    with buffer.lock:
+                        if buffer.depth_frame is None:
+                            time.sleep(0.01)
+                            continue
+                        _, encoded_img = cv2.imencode('.jpg', buffer.depth_frame)
+                    try:
+                        self.wfile.write(b'--frame\r\n')
+                        self.send_header('Content-type', 'image/jpeg')
+                        self.send_header('Content-length', str(len(encoded_img)))
+                        self.end_headers()
+                        self.wfile.write(encoded_img.tobytes())
+                        self.wfile.write(b'\r\n')
+                    except (ConnectionResetError, BrokenPipeError):
+                        break
+                    time.sleep(0.03)
+
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        pass
+
+    # Launch local background web server on Port 8089
+    server = ThreadedHTTPServer(('0.0.0.0', 8089), VideoStreamHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    
+    return buffer
+
+# Pull our unified persistence frame manager
+frame_buffer = initialize_camera_system()
 
 # ==========================================
-# 3. ROS 2 TELEMETRY SUB-NODE
-# ==========================================
-# ==========================================
-# 3. ROS 2 TELEMETRY SUB-NODE (UPDATED)
+# 2. ROS 2 TELEMETRY SUB-NODE
 # ==========================================
 class DistanceSubscriber(Node):
     def __init__(self):
@@ -161,29 +153,26 @@ def init_ros():
         rclpy.init()
     node = DistanceSubscriber()
     
-    # Spin the node continuously in a dedicated background thread.
-    # This prevents Streamlit page refreshes from colliding with the ROS executor.
+    # Safe multi-threaded ROS executor execution
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
-    
     return node
 
 ros_node = init_ros()
 
 
 # ==========================================
-# 4. MAIN INTERFACE LAYOUT (MOST IMPORTANT)
+# 3. MAIN USER INTERFACE
 # ==========================================
 st.title("🤖 Roselito Agent API")
 st.write("Interact with the guide robot and trigger pre-mapped navigation routes.")
 
-# Initialize the session state for process tracking
 if "robot_pid" not in st.session_state:
     st.session_state.robot_pid = None
 if "running_route_pid" not in st.session_state:
     st.session_state.running_route_pid = None
 
-# Status Display indicators
+# Status Headers
 status_col1, status_col2 = st.columns(2)
 with status_col1:
     if st.session_state.robot_pid:
@@ -197,68 +186,53 @@ with status_col2:
     else:
         st.error("📍 Navigation Route: INACTIVE")
 
-# Core Action Buttons
+# Operational Buttons
 col_start, col_stop = st.columns(2)
-
 with col_start:
-    if st.button("🚀 Start the Robot", width="stretch"):
+    if st.button("🚀 Start the Robot", use_container_width=True):
         if st.session_state.robot_pid is not None:
             st.warning("The robot is already running! Stop it first before restarting.")
         else:
             st.success("Robot initiation command sent!")
-            
             combined_cmd = (
                 "cd ~/Projects/roselito_robot && "
                 "source ./scripts/setup.bash && "
                 "source /opt/ros/humble/setup.bash && "
                 "ros2 launch roselito_ugv_jetson start.launch map:=/home/jetson/Projects/roselito_robot/braga/mapa_lcad"
             )
-            
-            process = subprocess.Popen(
-                combined_cmd,
-                shell=True,
-                executable="/bin/bash",
-                preexec_fn=os.setsid
-            )
-            
+            process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
             st.session_state.robot_pid = process.pid
             st.rerun()
 
 with col_stop:
-    if st.button("🛑 Emergency Stop", type="primary", width="stretch"):
+    if st.button("🛑 Emergency Stop", type="primary", use_container_width=True):
         killed_any = False
-        
-        # Kill core robot if running
         if st.session_state.robot_pid is not None:
             try:
                 os.killpg(os.getpgid(st.session_state.robot_pid), signal.SIGINT)
-                st.error(f"Terminated robot process group {st.session_state.robot_pid}.")
                 killed_any = True
             except ProcessLookupError:
-                st.warning("Robot process group was already dead.")
+                pass
             finally:
                 st.session_state.robot_pid = None
 
-        # Kill active navigation route if running
         if st.session_state.running_route_pid is not None:
             try:
                 os.killpg(os.getpgid(st.session_state.running_route_pid), signal.SIGINT)
-                st.error(f"Terminated route process group {st.session_state.running_route_pid}.")
                 killed_any = True
             except ProcessLookupError:
-                st.warning("Route process group was already dead.")
+                pass
             finally:
                 st.session_state.running_route_pid = None
 
-        if not killed_any:
-            st.info("No active processes were found to stop.")
-        
+        if killed_any:
+            st.error("Emergency halt signals sent successfully.")
         st.rerun()
 
 st.write("---")
 
 # ==========================================
-# 5. DYNAMIC ROUTE BUTTONS GRID
+# 4. ROUTE BUTTONS GRID
 # ==========================================
 st.subheader("Map Routes Grid")
 
@@ -271,17 +245,10 @@ def run_route(route_path):
         "source /opt/ros/humble/setup.bash && "
         "ros2 launch roselito_agent replay_route.launch path:={route_path}"
     )
-            
-    process = subprocess.Popen(
-        combined_cmd,
-        shell=True,
-        executable="/bin/bash",
-        preexec_fn=os.setsid
-    )
+    process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
     st.session_state.running_route_pid = process.pid
-    st.rerun()  # Instantly refresh to lock the route selection grid
+    st.rerun()
 
-# Scan for all .pon files in current working directory
 routes_dir = os.getcwd() 
 route_files = glob.glob(os.path.join(routes_dir, "*.pon"))
 
@@ -290,24 +257,19 @@ if not route_files:
 else:
     grid_columns = 4
     cols = st.columns(grid_columns)
-    
-    # Check if a route is currently tracking as running to handle blocking logic
     is_route_busy = st.session_state.running_route_pid is not None
     
     for idx, route_path in enumerate(sorted(route_files)):
         filename = os.path.basename(route_path)
         display_name = filename.replace(".pon", "").replace("_", " ").title()
-        
         with cols[idx % grid_columns]:
-            # Fixed Parameter Syntax: changed width="stretch" to width="stretch"
-            # Fixed Parameter Syntax: changed enabled=True to disabled=is_route_busy
-            if st.button(f"📍 {display_name}", key=filename, width="stretch", disabled=is_route_busy):
+            if st.button(f"📍 {display_name}", key=filename, use_container_width=True, disabled=is_route_busy):
                 run_route(route_path)
 
 st.write("---")
 
 # ==========================================
-# 6. LIVE HARDWARE FEEDS & TELEMETRY
+# 5. LIVE FEEDS RENDERING PANEL
 # ==========================================
 st.subheader("Hardware Feeds & Telemetry")
 
@@ -315,6 +277,7 @@ show_feeds = st.toggle("Enable Live Camera & ROS Monitor", value=False)
 
 if show_feeds:
     col1, col2, col3 = st.columns([2, 2, 1])
+    
     with col1:
         st.caption("RGB Feed")
         if frame_buffer.camera_available:
@@ -327,21 +290,16 @@ if show_feeds:
         if frame_buffer.camera_available:
             st.markdown('<img src="http://localhost:8089/depth" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
         else:
-            st.info(f"Reason: {frame_buffer.camera_error or 'Not Initialized'}")
+            st.info(f"Reason: {frame_buffer.camera_error or 'Initializing hardware...'}")
             
     with col3:
         st.caption("ROS Topics")
         distance_placeholder = st.empty()
 
-    # Telemetry Update Loop
-    # Runs efficiently because video streaming is offloaded completely to the browser thread
-    # and ROS spinning is safely managed by our background thread!
+    # Telemetry update loop runs unencumbered
     while show_feeds:
-        # Just read the value updated by the background thread
         if ros_node.current_distance is not None:
             distance_placeholder.metric(label="Person Distance", value=f"{ros_node.current_distance:.2f} m")
         else:
             distance_placeholder.info("Waiting for `/person_distance`...")
-        
-        # Lowering to 0.1s reduces CPU load on the Jetson while keeping UI responsive
         time.sleep(0.1)
