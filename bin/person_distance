@@ -46,8 +46,8 @@ class PersonDistance(Node):
         self.declare_parameter('image_scale', 1.5)
         self.declare_parameter('depth_sample_radius', 5)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
-        self.declare_parameter('model_config', '')
-        self.declare_parameter('model_weights', '')
+        self.declare_parameter('model_config', 'models/MobileNetSSD_deploy.prototxt')
+        self.declare_parameter('model_weights', 'models/MobileNetSSD_deploy.caffemodel')
 
         self.__confidence_threshold = self.get_parameter('confidence_threshold').value
         self.__image_scale          = self.get_parameter('image_scale').value
