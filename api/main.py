@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import subprocess
 import os
@@ -266,9 +267,8 @@ def run_route(route_path):
     process = subprocess.Popen(combined_cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
     st.session_state.running_route_pid = process.pid
     st.rerun()
-
-routes_dir = os.getcwd() 
-route_files = glob.glob(os.path.join(routes_dir, "*.pon"))
+routes_dir = Path(os.getcwd()).parent 
+route_files = [Path(f) for f in glob.glob(os.path.join(routes_dir, "*.pon"))]
 
 if not route_files:
     st.info(f"No `.pon` route files found in `{routes_dir}`.")
@@ -282,7 +282,7 @@ else:
         display_name = filename.replace(".pon", "").replace("_", " ").title()
         with cols[idx % grid_columns]:
             if st.button(f"📍 {display_name}", key=filename, use_container_width=True, disabled=is_route_busy):
-                run_route(route_path)
+                run_route(Path ( routes_dir / route_path))
 
 st.write("---")
 
