@@ -11,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from pathlib import Path
 
 # 1. ROS 2 Imports
 import rclpy
@@ -249,7 +250,7 @@ def run_route(route_path):
     st.session_state.running_route_pid = process.pid
     st.rerun()
 
-routes_dir = os.getcwd() 
+routes_dir = Path(os.getcwd()).parent 
 route_files = glob.glob(os.path.join(routes_dir, "*.pon"))
 
 if not route_files:
