@@ -39,11 +39,11 @@ class ReplayRoute(ParameterNode):
         self.declare_parameter('frequency', 20.0)
         self.declare_parameter('squared_threshold_distance',1.0)
         self.declare_parameter('person_position_topic', '/person_position')
-        self.declare_parameter('person_nearby_distance', 1.5)
+        self.declare_parameter('person_nearby_distance', 0.6)
         self.declare_parameter('person_detection_timeout', 1.0)
         # Number of consecutive ticks without a nearby person before the robot
         # pauses.  At 20 Hz the default of 40 gives a 2-second grace window.
-        self.declare_parameter('person_miss_limit', 40)
+        self.declare_parameter('person_miss_limit', 2)
 
         self.__squared_threshold_distance = self.get_parameter('squared_threshold_distance').value
         self.__person_position_topic = self.get_parameter('person_position_topic').value
