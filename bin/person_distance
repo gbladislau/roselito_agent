@@ -1,38 +1,20 @@
 #!/usr/bin/env python3
 
-r'''Detect a person using an Intel RealSense camera and publish their distance.
+r'''Detect a person using an Intel RealSense camera and publish distance, color, and depth streams.
 
 Reads aligned color + depth frames from a RealSense device, detects a person,
-samples the aligned depth frame at the center of the detected bounding box, and
-publishes the result as a geometry_msgs/PointStamped message on /person_position.
-
-Detection back-ends (selected at startup):
-
-  DNN (default, recommended)
-    Uses a MobileNet-SSD Caffe model via cv2.dnn.  Works well from ~0.5 m up to
-    8+ m and is robust to viewing angle.  Requires two model files:
-      - model_config  : path to MobileNetSSD_deploy.prototxt
-      - model_weights : path to MobileNetSSD_deploy.caffemodel
-    Leave either parameter empty to fall back to HOG.
-
-  HOG (fallback)
-    Uses OpenCV's built-in HOGDescriptor with the default people detector.
-    Works reliably only up to ~2-3 m on a frontal view.
-
-The published point is expressed in the camera frame:
-  x = forward distance to the person (metres, from depth)
-  y = lateral offset   (metres, positive = right)
-  z = vertical offset  (metres, positive = up)
-
-If no person is detected in a frame, nothing is published.  The replay_route
-node treats the absence of a recent message as "person not nearby" and pauses
-waypoint advancement.
+samples the depth, and publishes:
+  - /person_position : geometry_msgs/PointStamped
+  - /camera/color/image_raw : sensor_msgs/Image
+  - /camera/depth/image_raw : sensor_msgs/Image
 '''
 
 import rclpy
 from rclpy.node import Node
 
 import geometry_msgs.msg
+import sensor_msgs.msg
+from cv_bridge import CvBridge
 
 import cv2
 import numpy as np
@@ -49,7 +31,7 @@ _DNN_SCALE = 1.0 / 127.5
 
 
 class PersonDistance(Node):
-    r'''Detect a person and publish their distance from the camera.'''
+    r'''Detect a person and publish their distance from the camera alongside live video feeds.'''
 
     def __init__(self):
         super().__init__('person_distance')
@@ -61,14 +43,9 @@ class PersonDistance(Node):
         self.declare_parameter('confidence_threshold', 0.4)
         self.declare_parameter('frame_width', 640)
         self.declare_parameter('frame_height', 480)
-        # Upscale the colour image by this factor before detection.
-        # Values > 1 help find people who appear small at distance.
         self.declare_parameter('image_scale', 1.5)
-        # Pixels around the bounding-box centre to median-average for depth.
         self.declare_parameter('depth_sample_radius', 5)
-        # Optical frame id stamped on published messages.
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
-        # DNN model files.  Leave empty to use HOG fallback.
         self.declare_parameter('model_config', '')
         self.declare_parameter('model_weights', '')
 
@@ -85,6 +62,9 @@ class PersonDistance(Node):
         self.get_logger().info(f'Image scale          : {self.__image_scale}')
         self.get_logger().info(f'Camera frame         : {self.__camera_frame}')
         self.get_logger().info(f'Resolution           : {width}x{height}')
+
+        # Initialize the ROS to OpenCV converter bridge
+        self.__bridge = CvBridge()
 
         # ------------------------------------------------------------------ #
         # Detector selection
@@ -121,13 +101,16 @@ class PersonDistance(Node):
 
         # Align depth to colour so pixels correspond 1-to-1.
         self.__align = rs.align(rs.stream.color)
+        
+        # Colorizer used to turn raw Z16 depth units into a viewable RGB colormap for Streamlit
+        self.__colorizer = rs.colorizer()
 
         # Camera intrinsics for back-projection.
         color_profile = profile.get_stream(rs.stream.color)
         self.__intrinsics = color_profile.as_video_stream_profile().get_intrinsics()
 
         # ------------------------------------------------------------------ #
-        # Publisher
+        # Publishers
         # ------------------------------------------------------------------ #
         self.__pub = self.create_publisher(
             geometry_msgs.msg.PointStamped,
@@ -135,10 +118,22 @@ class PersonDistance(Node):
             1,
         )
 
+        # New Image Stream Publishers
+        self.__pub_color = self.create_publisher(
+            sensor_msgs.msg.Image,
+            '/camera/color/image_raw',
+            10
+        )
+        self.__pub_depth = self.create_publisher(
+            sensor_msgs.msg.Image,
+            '/camera/depth/image_raw',
+            10
+        )
+
         period = 1.0 / self.get_parameter('frequency').value
         self.__timer = self.create_timer(period, self.__callback)
 
-        self.get_logger().info('person_distance node ready.')
+        self.get_logger().info('person_distance node ready with Image Pipelines.')
 
     def __del__(self):
         try:
@@ -147,15 +142,11 @@ class PersonDistance(Node):
             pass
 
     # ------------------------------------------------------------------ #
-    # Detection back-ends  — each returns (cx, cy) in *original* image
-    # coords, or None if no person found.
+    # Detection back-ends — each returns (cx, cy) or None
     # ------------------------------------------------------------------ #
 
     def __detect_dnn(self, color_image: np.ndarray):
-        r'''Run MobileNet-SSD and return (cx, cy) of best person detection.'''
         h, w = color_image.shape[:2]
-
-        # Optionally upscale before creating the blob — helps at distance.
         if self.__image_scale != 1.0:
             detect_img = cv2.resize(
                 color_image,
@@ -171,7 +162,7 @@ class PersonDistance(Node):
             mean=(_DNN_MEAN, _DNN_MEAN, _DNN_MEAN),
         )
         self.__net.setInput(blob)
-        detections = self.__net.forward()  # shape: (1, 1, N, 7)
+        detections = self.__net.forward()
 
         best_conf = -1.0
         best_box  = None
@@ -189,7 +180,6 @@ class PersonDistance(Node):
                 continue
 
             best_conf = confidence
-            # Box coords are normalised [0,1] relative to detect_img.
             x1 = int(detections[0, 0, i, 3] * dw)
             y1 = int(detections[0, 0, i, 4] * dh)
             x2 = int(detections[0, 0, i, 5] * dw)
@@ -200,18 +190,12 @@ class PersonDistance(Node):
             return None
 
         x1, y1, x2, y2 = best_box
-        # Map centre back to original image coords.
         cx = int(((x1 + x2) / 2) / self.__image_scale)
         cy = int(((y1 + y2) / 2) / self.__image_scale)
-        self.get_logger().info(
-            f'DNN person: box=({x1},{y1})-({x2},{y2}) conf={best_conf:.2f}'
-        )
         return cx, cy
 
     def __detect_hog(self, color_image: np.ndarray):
-        r'''Run HOG detector and return (cx, cy) of best detection.'''
         h, w = color_image.shape[:2]
-
         if self.__image_scale != 1.0:
             detect_img = cv2.resize(
                 color_image,
@@ -244,7 +228,6 @@ class PersonDistance(Node):
         rx, ry, rw, rh = best_rect
         cx = int((rx + rw // 2) / self.__image_scale)
         cy = int((ry + rh // 2) / self.__image_scale)
-        self.get_logger().info(f'HOG person: weight={best_weight:.2f}')
         return cx, cy
 
     # ------------------------------------------------------------------ #
@@ -252,10 +235,6 @@ class PersonDistance(Node):
     # ------------------------------------------------------------------ #
 
     def __sample_depth(self, depth_image: np.ndarray, cx: int, cy: int) -> float:
-        r'''Return median depth (metres) in a small patch around (cx, cy).
-
-        Returns 0.0 if the patch contains no valid (non-zero) readings.
-        '''
         r = self.__depth_sample_radius
         h, w = depth_image.shape
         x0, x1 = max(0, cx - r), min(w, cx + r + 1)
@@ -267,18 +246,12 @@ class PersonDistance(Node):
         return float(np.median(valid)) * self.__depth_scale
 
     def __pixel_to_point(self, cx: int, cy: int, depth_m: float):
-        r'''Back-project a colour pixel + depth to 3-D camera coordinates.
-
-        Returns (x_forward, y_right, z_up) in metres.
-        RealSense convention: X=right, Y=down, Z=forward.
-        We remap: x=forward, y=lateral(right+), z=vertical(up+).
-        '''
         point_rs = rs.rs2_deproject_pixel_to_point(
             self.__intrinsics, [cx, cy], depth_m
         )
-        x_forward  =  point_rs[2]   # Z_rs
-        y_lateral  =  point_rs[0]   # X_rs
-        z_vertical = -point_rs[1]   # -Y_rs
+        x_forward  =  point_rs[2]   
+        y_lateral  =  point_rs[0]   
+        z_vertical = -point_rs[1]   
         return x_forward, y_lateral, z_vertical
 
     # ------------------------------------------------------------------ #
@@ -286,7 +259,6 @@ class PersonDistance(Node):
     # ------------------------------------------------------------------ #
 
     def __callback(self):
-        r'''Grab one frame-set, detect a person, publish distance.'''
         try:
             frames = self.__pipeline.poll_for_frames()
         except Exception as e:
@@ -303,37 +275,54 @@ class PersonDistance(Node):
         if not color_frame or not depth_frame:
             return
 
+        # Convert to numpy arrays
         color_image = np.asanyarray(color_frame.get_data())
-        depth_image = np.asanyarray(depth_frame.get_data())  # uint16, raw units
+        depth_image = np.asanyarray(depth_frame.get_data())
 
+        # Generate visual colorized depth map
+        colorized_depth = np.asanyarray(self.__colorizer.colorize(depth_frame).get_data())
+        depth_bgr = cv2.cvtColor(colorized_depth, cv2.COLOR_RGB2BGR)
+
+        # Timestamp tracking for synchronizing topics
+        current_time = self.get_clock().now().to_msg()
+
+        # Publish the raw image feeds via ROS
+        try:
+            color_msg = self.__bridge.cv2_to_imgmsg(color_image, encoding="bgr8")
+            color_msg.header.stamp = current_time
+            color_msg.header.frame_id = self.__camera_frame
+            self.__pub_color.publish(color_msg)
+
+            depth_msg = self.__bridge.cv2_to_imgmsg(depth_bgr, encoding="bgr8")
+            depth_msg.header.stamp = current_time
+            depth_msg.header.frame_id = self.__camera_frame
+            self.__pub_depth.publish(depth_msg)
+        except Exception as img_err:
+            self.get_logger().error(f"Image conversion/publishing failed: {img_err}")
+
+        # Execute person detection tracking
         result = self.__detect(color_image)
         if result is None:
-            return  # No detection — replay_route timeout handles the pause.
+            return  
 
         cx, cy = result
         depth_m = self.__sample_depth(depth_image, cx, cy)
         if depth_m <= 0.0:
-            self.get_logger().debug('Detection found but depth is zero; skipping.')
             return
 
         x_fwd, y_lat, z_vert = self.__pixel_to_point(cx, cy, depth_m)
 
         msg = geometry_msgs.msg.PointStamped()
-        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.stamp    = current_time
         msg.header.frame_id = self.__camera_frame
         msg.point.x = x_fwd
         msg.point.y = y_lat
         msg.point.z = z_vert
 
         self.__pub.publish(msg)
-        self.get_logger().info(
-            f'Person detected: depth={depth_m:.2f} m  '
-            f'fwd={x_fwd:.2f}  lat={y_lat:.2f}  vert={z_vert:.2f}'
-        )
 
 
 def main():
-    r'''Start the node.'''
     rclpy.init()
     node = PersonDistance()
     try:
