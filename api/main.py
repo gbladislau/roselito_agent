@@ -143,6 +143,9 @@ start_camera_thread()
 # ==========================================
 # 3. ROS 2 TELEMETRY SUB-NODE
 # ==========================================
+# ==========================================
+# 3. ROS 2 TELEMETRY SUB-NODE (UPDATED)
+# ==========================================
 class DistanceSubscriber(Node):
     def __init__(self):
         super().__init__('streamlit_distance_subscriber')
@@ -156,7 +159,14 @@ class DistanceSubscriber(Node):
 def init_ros():
     if not rclpy.ok():
         rclpy.init()
-    return DistanceSubscriber()
+    node = DistanceSubscriber()
+    
+    # Spin the node continuously in a dedicated background thread.
+    # This prevents Streamlit page refreshes from colliding with the ROS executor.
+    ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    ros_thread.start()
+    
+    return node
 
 ros_node = init_ros()
 
@@ -325,10 +335,13 @@ if show_feeds:
 
     # Telemetry Update Loop
     # Runs efficiently because video streaming is offloaded completely to the browser thread
+    # and ROS spinning is safely managed by our background thread!
     while show_feeds:
-        rclpy.spin_once(ros_node, timeout_sec=0.01)
+        # Just read the value updated by the background thread
         if ros_node.current_distance is not None:
             distance_placeholder.metric(label="Person Distance", value=f"{ros_node.current_distance:.2f} m")
         else:
             distance_placeholder.info("Waiting for `/person_distance`...")
-        time.sleep(0.05)
+        
+        # Lowering to 0.1s reduces CPU load on the Jetson while keeping UI responsive
+        time.sleep(0.1)
