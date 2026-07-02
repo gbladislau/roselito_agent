@@ -23,7 +23,7 @@ import pyrealsense2 as rs
 # MobileNet-SSD was trained on VOC; class index 15 = "person".
 _DNN_PERSON_CLASS = 15
 # Input blob size expected by MobileNet-SSD.
-_DNN_INPUT_SIZE = (300, 300)
+_DNN_INPUT_SIZE = (640, 480)
 # Pixel mean subtracted during DNN pre-processing.
 _DNN_MEAN = 127.5
 # Scale factor applied to pixel values during DNN pre-processing.
@@ -39,12 +39,12 @@ class PersonDistance(Node):
         # ------------------------------------------------------------------ #
         # Parameters
         # ------------------------------------------------------------------ #
-        self.declare_parameter('frequency', 10.0)
+        self.declare_parameter('frequency', 60.0)
         self.declare_parameter('confidence_threshold', 0.4)
         self.declare_parameter('frame_width', 640)
         self.declare_parameter('frame_height', 480)
         self.declare_parameter('image_scale', 1.5)
-        self.declare_parameter('depth_sample_radius', 5)
+        self.declare_parameter('depth_sample_radius', 3)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('model_config', 'models/MobileNetSSD_deploy.prototxt')
         self.declare_parameter('model_weights', 'models/MobileNetSSD_deploy.caffemodel')
