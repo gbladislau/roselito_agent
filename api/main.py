@@ -7,6 +7,10 @@ import signal
 import cv2
 import streamlit as st
 import glob
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 # 1. ROS 2 Imports
 import rclpy
@@ -16,7 +20,128 @@ from std_msgs.msg import Float32
 st.set_page_config(layout="wide")
 
 # ==========================================
-# 1. ROS 2 & CAMERA INITIALIZATION (CACHED)
+# GLOBAL THREAD SAFE BUFFER FOR CAMERAS
+# ==========================================
+class CameraFrameBuffer:
+    def __init__(self):
+        self.bgr_frame = None
+        self.depth_frame = None
+        self.lock = threading.Lock()
+        self.camera_available = False
+        self.camera_error = ""
+
+frame_buffer = CameraFrameBuffer()
+
+# ==========================================
+# 1. BACKGROUND MJPEG STREAMING SERVER
+# ==========================================
+class VideoStreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/rgb':
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            while True:
+                with frame_buffer.lock:
+                    if frame_buffer.bgr_frame is None:
+                        time.sleep(0.01)
+                        continue
+                    _, encoded_img = cv2.imencode('.jpg', frame_buffer.bgr_frame)
+                
+                try:
+                    self.wfile.write(b'--frame\r\n')
+                    self.send_header('Content-type', 'image/jpeg')
+                    self.send_header('Content-length', str(len(encoded_img)))
+                    self.end_headers()
+                    self.wfile.write(encoded_img.tobytes())
+                    self.wfile.write(b'\r\n')
+                except (ConnectionResetError, BrokenPipeError):
+                    break
+                time.sleep(0.03)  # Cap around ~30 FPS
+
+        elif self.path == '/depth':
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            while True:
+                with frame_buffer.lock:
+                    if frame_buffer.depth_frame is None:
+                        time.sleep(0.01)
+                        continue
+                    _, encoded_img = cv2.imencode('.jpg', frame_buffer.depth_frame)
+                
+                try:
+                    self.wfile.write(b'--frame\r\n')
+                    self.send_header('Content-type', 'image/jpeg')
+                    self.send_header('Content-length', str(len(encoded_img)))
+                    self.end_headers()
+                    self.wfile.write(encoded_img.tobytes())
+                    self.wfile.write(b'\r\n')
+                except (ConnectionResetError, BrokenPipeError):
+                    break
+                time.sleep(0.03)
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle camera stream network requests in independent threads."""
+    pass
+
+@st.cache_resource
+def start_mjpeg_server():
+    server = ThreadedHTTPServer(('0.0.0.0', 8089), VideoStreamHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    return server
+
+# ==========================================
+# 2. HARDWARE CAPTURE THREAD (REALSENSE)
+# ==========================================
+@st.cache_resource
+def start_camera_thread():
+    def camera_loop():
+        try:
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            pipeline.start(config)
+            align = rs.align(rs.stream.color)
+            colorizer = rs.colorizer()
+            
+            with frame_buffer.lock:
+                frame_buffer.camera_available = True
+            
+            while True:
+                frames = pipeline.wait_for_frames(timeout_ms=1000)
+                aligned_frames = align.process(frames)
+                depth_f = aligned_frames.get_depth_frame()
+                color_f = aligned_frames.get_color_frame()
+                
+                if not depth_f or not color_f:
+                    continue
+                
+                local_bgr = np.asanyarray(color_f.get_data())
+                local_colorized_depth = np.asanyarray(colorizer.colorize(depth_f).get_data())
+                local_depth_bgr = cv2.cvtColor(local_colorized_depth, cv2.COLOR_RGB2BGR)
+
+                with frame_buffer.lock:
+                    frame_buffer.bgr_frame = local_bgr
+                    frame_buffer.depth_frame = local_depth_bgr
+                    
+        except Exception as e:
+            with frame_buffer.lock:
+                frame_buffer.camera_available = False
+                frame_buffer.camera_error = str(e)
+
+    cam_thread = threading.Thread(target=camera_loop, daemon=True)
+    cam_thread.start()
+    return True
+
+# Initialize Background Pipelines
+start_mjpeg_server()
+start_camera_thread()
+
+# ==========================================
+# 3. ROS 2 TELEMETRY SUB-NODE
 # ==========================================
 class DistanceSubscriber(Node):
     def __init__(self):
@@ -33,55 +158,45 @@ def init_ros():
         rclpy.init()
     return DistanceSubscriber()
 
-@st.cache_resource
-def init_realsense():
-    # Returns (pipeline, align, colorizer, success_flag, error_message)
-    try:
-        pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        pipeline.start(config)
-        align = rs.align(rs.stream.color)
-        colorizer = rs.colorizer()
-        return pipeline, align, colorizer, True, ""
-    except Exception as e:
-        return None, None, None, False, str(e)
-
-# Initialize background elements gracefully
 ros_node = init_ros()
-pipeline, align, colorizer, camera_available, camera_error = init_realsense()
 
 
 # ==========================================
-# 2. MAIN API SECTION (MOST IMPORTANT)
+# 4. MAIN INTERFACE LAYOUT (MOST IMPORTANT)
 # ==========================================
-st.title("🤖 - Roselito Agent API")
+st.title("🤖 Roselito Agent API")
 st.write("Interact with the guide robot and trigger pre-mapped navigation routes.")
 
-# Core Action Buttons
+# Initialize the session state for process tracking
 if "robot_pid" not in st.session_state:
     st.session_state.robot_pid = None
 if "running_route_pid" not in st.session_state:
     st.session_state.running_route_pid = None
 
-# Optional: Add a visual status indicator for peace of mind
-if st.session_state.robot_pid:
-    st.success(f"🤖 Robot Status: RUNNING (PID: {st.session_state.robot_pid})")
-else:
-    st.error("🤖 Robot Status: STOPPED")
+# Status Display indicators
+status_col1, status_col2 = st.columns(2)
+with status_col1:
+    if st.session_state.robot_pid:
+        st.success(f"🤖 Main Robot: RUNNING (PID: {st.session_state.robot_pid})")
+    else:
+        st.error("🤖 Main Robot: STOPPED")
 
+with status_col2:
+    if st.session_state.running_route_pid:
+        st.success(f"📍 Navigation Route: ACTIVE (PID: {st.session_state.running_route_pid})")
+    else:
+        st.error("📍 Navigation Route: INACTIVE")
 
+# Core Action Buttons
 col_start, col_stop = st.columns(2)
 
 with col_start:
-    if st.button("🚀 Start the Robot", use_container_width=True):
+    if st.button("🚀 Start the Robot", width="stretch"):
         if st.session_state.robot_pid is not None:
             st.warning("The robot is already running! Stop it first before restarting.")
         else:
             st.success("Robot initiation command sent!")
             
-            # Chain the commands: navigate, source environmental variables, and launch
             combined_cmd = (
                 "cd ~/Projects/roselito_robot && "
                 "source ./scripts/setup.bash && "
@@ -89,64 +204,53 @@ with col_start:
                 "ros2 launch roselito_ugv_jetson start.launch map:=/home/jetson/Projects/roselito_robot/braga/mapa_lcad"
             )
             
-            # Launch as an asynchronous background process group
             process = subprocess.Popen(
                 combined_cmd,
                 shell=True,
-                executable="/bin/bash",      # Forces Python to use Bash so 'source' works
-                preexec_fn=os.setsid         # Creates a new process group ID (PGID) matching the PID
+                executable="/bin/bash",
+                preexec_fn=os.setsid
             )
             
-            # Save the PID to session state so it survives Streamlit page refreshes
             st.session_state.robot_pid = process.pid
-            st.rerun()  # Force a quick rerun to update the UI status immediately
+            st.rerun()
 
 with col_stop:
-    if st.button("🛑 Emergency Stop", type="primary", use_container_width=True):
+    if st.button("🛑 Emergency Stop", type="primary", width="stretch"):
+        killed_any = False
+        
+        # Kill core robot if running
         if st.session_state.robot_pid is not None:
-            pid_to_kill = st.session_state.robot_pid
             try:
-                # Send SIGINT (Ctrl+C equivalent) to the ENTIRE process group.
-                # ROS 2 nodes handle SIGINT beautifully to unregister and park safely.
-                os.killpg(os.getpgid(pid_to_kill), signal.SIGINT)
-                st.error(f"Emergency Stop triggered! Successfully terminated process group {pid_to_kill}.")
+                os.killpg(os.getpgid(st.session_state.robot_pid), signal.SIGINT)
+                st.error(f"Terminated robot process group {st.session_state.robot_pid}.")
+                killed_any = True
             except ProcessLookupError:
-                st.warning("Process group was already closed or dead.")
-            except Exception as e:
-                st.error(f"Failed to cleanly stop the process: {e}")
+                st.warning("Robot process group was already dead.")
             finally:
-                # Reset state variables regardless of execution success
                 st.session_state.robot_pid = None
-                st.rerun()
+
+        # Kill active navigation route if running
         if st.session_state.running_route_pid is not None:
-            pid_to_kill = st.session_state.running_route_pid
             try:
-                # Send SIGINT (Ctrl+C equivalent) to the ENTIRE process group.
-                # ROS 2 nodes handle SIGINT beautifully to unregister and park safely.
-                os.killpg(os.getpgid(pid_to_kill), signal.SIGINT)
-                st.error(f"Emergency Stop triggered! Successfully terminated route group {pid_to_kill}.")
+                os.killpg(os.getpgid(st.session_state.running_route_pid), signal.SIGINT)
+                st.error(f"Terminated route process group {st.session_state.running_route_pid}.")
+                killed_any = True
             except ProcessLookupError:
-                st.warning("Process group was already closed or dead.")
-            except Exception as e:
-                st.error(f"Failed to cleanly stop the process: {e}")
+                st.warning("Route process group was already dead.")
             finally:
-                # Reset state variables regardless of execution success
                 st.session_state.running_route_pid = None
-                st.rerun()
-        else:
-            st.info("No active robot process is currently tracked to stop.")
+
+        if not killed_any:
+            st.info("No active processes were found to stop.")
+        
+        st.rerun()
+
 st.write("---")
 
 # ==========================================
-# 3. DYNAMIC ROUTE BUTTONS GRID
+# 5. DYNAMIC ROUTE BUTTONS GRID
 # ==========================================
 st.subheader("Map Routes Grid")
-
-# Optional: Add a visual status indicator for peace of mind
-if st.session_state.running_route_pid:
-    st.success(f"🤖 Robot Status: RUNNING ROUTE (PID: {st.session_state.running_route_pid})")
-else:
-    st.error("🤖 Robot Status: STOPPED ROUTE")
 
 def run_route(route_path):
     st.info(f"Launching route: {os.path.basename(route_path)}...")
@@ -158,94 +262,73 @@ def run_route(route_path):
         "ros2 launch roselito_agent replay_route.launch path:={route_path}"
     )
             
-    # Launch as an asynchronous background process group
     process = subprocess.Popen(
         combined_cmd,
         shell=True,
-        executable="/bin/bash",      # Forces Python to use Bash so 'source' works
-        preexec_fn=os.setsid         # Creates a new process group ID (PGID) matching the PID
+        executable="/bin/bash",
+        preexec_fn=os.setsid
     )
-    
-    # Save the PID to session state so it survives Streamlit page refreshes
     st.session_state.running_route_pid = process.pid
+    st.rerun()  # Instantly refresh to lock the route selection grid
 
-# Scan for all .pon files in the current working directory
-# Change path string if your files live specifically one folder up
+# Scan for all .pon files in current working directory
 routes_dir = os.getcwd() 
 route_files = glob.glob(os.path.join(routes_dir, "*.pon"))
 
 if not route_files:
     st.info(f"No `.pon` route files found in `{routes_dir}`.")
 else:
-    # Build a 4-column wide grid dynamically
     grid_columns = 4
     cols = st.columns(grid_columns)
+    
+    # Check if a route is currently tracking as running to handle blocking logic
+    is_route_busy = st.session_state.running_route_pid is not None
     
     for idx, route_path in enumerate(sorted(route_files)):
         filename = os.path.basename(route_path)
         display_name = filename.replace(".pon", "").replace("_", " ").title()
         
-        # Distribute buttons evenly across columns
         with cols[idx % grid_columns]:
-            if st.button(f"📍 {display_name}", key=filename, use_container_width=True, enabled=True if not st.session_state.running_route_pid else False):
+            # Fixed Parameter Syntax: changed width="stretch" to width="stretch"
+            # Fixed Parameter Syntax: changed enabled=True to disabled=is_route_busy
+            if st.button(f"📍 {display_name}", key=filename, width="stretch", disabled=is_route_busy):
                 run_route(route_path)
 
 st.write("---")
 
 # ==========================================
-# 4. OPTIONAL LIVE STREAM & TELEMETRY SECTION
+# 6. LIVE HARDWARE FEEDS & TELEMETRY
 # ==========================================
 st.subheader("Hardware Feeds & Telemetry")
 
-# Toggle activation switch to spin the heavy camera loop
 show_feeds = st.toggle("Enable Live Camera & ROS Monitor", value=False)
 
 if show_feeds:
-    # Setup live placeholders
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         st.caption("RGB Feed")
-        rgb_placeholder = st.empty()
+        if frame_buffer.camera_available:
+            st.markdown('<img src="http://localhost:8089/rgb" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
+        else:
+            st.warning("Camera hardware stream is offline.")
+            
     with col2:
         st.caption("Depth Map")
-        depth_placeholder = st.empty()
+        if frame_buffer.camera_available:
+            st.markdown('<img src="http://localhost:8089/depth" style="width:100%; border-radius:10px;">', unsafe_allow_html=True)
+        else:
+            st.info(f"Reason: {frame_buffer.camera_error or 'Not Initialized'}")
+            
     with col3:
         st.caption("ROS Topics")
         distance_placeholder = st.empty()
 
-    # Loop execution container
+    # Telemetry Update Loop
+    # Runs efficiently because video streaming is offloaded completely to the browser thread
     while show_feeds:
-        # A. Always update ROS telemetry, even if camera fails
-        rclpy.spin_once(ros_node, timeout_sec=0.005)
+        rclpy.spin_once(ros_node, timeout_sec=0.01)
         if ros_node.current_distance is not None:
             distance_placeholder.metric(label="Person Distance", value=f"{ros_node.current_distance:.2f} m")
         else:
             distance_placeholder.info("Waiting for `/person_distance`...")
-
-        # B. Handle Camera frames conditionally
-        if camera_available:
-            try:
-                frames = pipeline.wait_for_frames(timeout_ms=20)
-                aligned_frames = align.process(frames)
-                depth_frame = aligned_frames.get_depth_frame()
-                color_frame = aligned_frames.get_color_frame()
-                
-                if depth_frame and color_frame:
-                    color_image = np.asanyarray(color_frame.get_data())
-                    color_image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-                    
-                    colorized_depth = colorizer.colorize(depth_frame)
-                    depth_image = np.asanyarray(colorized_depth.get_data())
-
-                    rgb_placeholder.image(color_image_rgb, channels="RGB", use_container_width=True)
-                    depth_placeholder.image(depth_image, channels="RGB", use_container_width=True)
-            except RuntimeError:
-                # Frame dropped, skip iteration safely
-                pass
-        else:
-            rgb_placeholder.warning("Camera connection unavailable.")
-            depth_placeholder.info(f"Reason: {camera_error}")
-            
-            # Since camera isn't updating frames, add a sleep to prevent maxing out CPU during ROS-only mode
-            import time
-            time.sleep(0.1)
+        time.sleep(0.05)
